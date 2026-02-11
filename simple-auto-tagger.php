@@ -122,9 +122,25 @@ function sat_render_settings_page() {
     }
 
     $opts = sat_get_options();
+    $backfill_url = wp_nonce_url(
+        admin_url('admin-post.php?action=sat_backfill'),
+        'sat_backfill',
+        'sat_nonce'
+    );
     ?>
     <div class="wrap">
         <h1>Simple Auto Tagger</h1>
+
+        <?php if (!empty($_GET['sat_backfill_done'])) : ?>
+            <div class="notice notice-success is-dismissible">
+                <p>Backfill complete.</p>
+            </div>
+        <?php elseif (!empty($_GET['sat_backfill_progress'])) : ?>
+            <div class="notice notice-info is-dismissible">
+                <p>Backfill in progress...</p>
+            </div>
+        <?php endif; ?>
+
         <form method="post" action="options.php">
             <?php settings_fields('sat_settings'); ?>
             <table class="form-table" role="presentation">
@@ -152,6 +168,93 @@ function sat_render_settings_page() {
             </table>
             <?php submit_button(); ?>
         </form>
+
+        <hr />
+
+        <h2>Backfill existing posts</h2>
+        <p>Runs the same rules against existing posts and applies the configured tag. This can take a while on large sites and runs in batches.</p>
+        <p>
+            <a class="button button-secondary" href="<?php echo esc_url($backfill_url); ?>" onclick="return confirm('Run backfill on existing posts?');">Run backfill now</a>
+        </p>
     </div>
     <?php
 }
+
+function sat_handle_backfill_request() {
+    if (!current_user_can('manage_options')) {
+        wp_die('Insufficient permissions.');
+    }
+
+    $nonce = isset($_GET['sat_nonce']) ? sanitize_text_field(wp_unslash($_GET['sat_nonce'])) : '';
+    if (!wp_verify_nonce($nonce, 'sat_backfill')) {
+        wp_die('Invalid nonce.');
+    }
+
+    $opts = sat_get_options();
+    $tag_slug = sanitize_title($opts['tag_slug']);
+    if ($tag_slug === '') {
+        wp_die('Tag slug is required.');
+    }
+
+    $title_trigger = (string) $opts['title_trigger'];
+    $content_trigger = (string) $opts['content_trigger'];
+
+    if (trim($title_trigger) === '' && trim($content_trigger) === '') {
+        wp_die('Set at least one trigger before running backfill.');
+    }
+
+    sat_ensure_tag_exists($tag_slug);
+
+    $paged = isset($_GET['sat_paged']) ? max(1, (int) $_GET['sat_paged']) : 1;
+    $per_page = 200;
+
+    $q = new WP_Query(array(
+        'post_type'      => 'post',
+        'post_status'    => 'any',
+        'posts_per_page' => $per_page,
+        'paged'          => $paged,
+        'fields'         => 'ids',
+        'no_found_rows'  => false,
+    ));
+
+    foreach ($q->posts as $post_id) {
+        $p = get_post($post_id);
+        if (!($p instanceof WP_Post)) {
+            continue;
+        }
+
+        $matched = false;
+        if (sat_title_has_trigger($p->post_title, $title_trigger)) {
+            $matched = true;
+        }
+        if (!$matched && sat_content_has_trigger($p->post_content, $content_trigger)) {
+            $matched = true;
+        }
+
+        if ($matched) {
+            wp_set_post_terms($post_id, array($tag_slug), 'post_tag', true);
+        }
+    }
+
+    $settings_url = admin_url('options-general.php?page=simple-auto-tagger');
+    $max_pages = (int) $q->max_num_pages;
+
+    if ($paged < $max_pages) {
+        $next_url = add_query_arg(
+            array(
+                'action'               => 'sat_backfill',
+                'sat_nonce'            => $nonce,
+                'sat_paged'            => $paged + 1,
+                'sat_backfill_progress' => 1,
+            ),
+            admin_url('admin-post.php')
+        );
+        wp_safe_redirect($next_url);
+        exit;
+    }
+
+    $done_url = add_query_arg(array('sat_backfill_done' => 1), $settings_url);
+    wp_safe_redirect($done_url);
+    exit;
+}
+add_action('admin_post_sat_backfill', 'sat_handle_backfill_request');
